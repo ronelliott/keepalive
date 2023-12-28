@@ -10,7 +10,8 @@ import (
 // workerEntry is a helper struct that holds the state of a worker and is used
 // internally by the default Manager implementation.
 type workerEntry struct {
-	stopped bool
+	stop    chan bool
+	stopped chan bool
 	worker  Worker
 }
 
@@ -28,21 +29,28 @@ func NewManager() Manager {
 }
 
 // keepalive is a helper function that will restart a worker if it fails after a delay.
-func (manager *managerImpl) keepalive(name string, stopped *bool, worker func() error) {
+func (manager *managerImpl) keepalive(name string, stop <-chan bool, stopped chan<- bool, worker func() error) {
+	defer func() {
+		stopped <- true
+		close(stopped)
+		log.Debug().Str("name", name).Msg("Exited keepalive loop")
+	}()
 	backoff := NewExponentialBackoff(time.Second, time.Minute)
 	for {
-		if err := worker(); err != nil {
-			log.Error().Err(err).Str("name", name).Msg("Worker failed")
+		select {
+		case <-stop:
+			log.Debug().Str("name", name).Msg("Worker stopped by request, not restarting")
+			return
+		default:
+			log.Debug().Str("name", name).Msg("Calling worker function")
+			if err := worker(); err != nil {
+				log.Error().Err(err).Str("name", name).Msg("Worker failed")
+			}
 		}
 
-		if *stopped {
-			log.Debug().Str("name", name).Msg("Worker stopped, not restarting")
-			return
-		} else {
-			delay := backoff()
-			log.Warn().Str("name", name).Dur("delay", delay).Msg("Worker stopped, restarting after delay")
-			time.Sleep(delay)
-		}
+		delay := backoff()
+		log.Warn().Str("name", name).Dur("delay", delay).Msg("Worker stopped, restarting after delay")
+		time.Sleep(delay)
 	}
 }
 
@@ -54,6 +62,7 @@ func (manager *managerImpl) AddWorker(name string, worker Worker) error {
 	defer manager.mutex.Unlock()
 
 	if _, ok := manager.workers[name]; ok {
+		log.Error().Str("name", name).Msg("Cannot add worker, worker already exists")
 		return ErrorWorkerAlreadyExists
 	}
 
@@ -61,6 +70,7 @@ func (manager *managerImpl) AddWorker(name string, worker Worker) error {
 		worker: worker,
 	}
 
+	log.Debug().Str("name", name).Msg("Worker added")
 	return nil
 }
 
@@ -90,41 +100,69 @@ func (manager *managerImpl) StartWorker(names ...string) error {
 	for _, name := range names {
 		definition, ok := manager.workers[name]
 		if !ok {
-			log.Error().Str("name", name).Msg("Worker not found")
+			log.Error().Str("name", name).Msg("Cannot start worker, worker not found")
 			return ErrorWorkerNotFound
 		}
 
+		if definition.stop != nil {
+			log.Debug().Str("name", name).Msg("Cannot start worker, worker already running")
+			return ErrorWorkerAlreadyRunning
+		}
+
 		log.Debug().Str("name", name).Msg("Starting worker")
-		definition.stopped = false
-		go manager.keepalive(name, &definition.stopped, definition.worker.Run)
+		definition.stop = make(chan bool, 1)
+		definition.stopped = make(chan bool, 1)
+		go manager.keepalive(name, definition.stop, definition.stopped, definition.worker.Run)
+		log.Debug().Str("name", name).Msg("Started worker")
 	}
 
 	return nil
 }
 
-// StopWorker stops the worker with the given name. If the worker is not found,
-// ErrorWorkerNotFound is returned. If multiple workers are given, they are
-// stopped in the order given. If any worker fails to stop, the error is logged
-// and returned and no further workers are stopped.
+// StopWorker stops the worker with the given name and waits for it to stop. If
+// the worker is not found, ErrorWorkerNotFound is returned. If multiple workers
+// are given, they are stopped in the order given. If any worker fails to stop,
+// the error is logged and returned and no further workers are stopped, however
+// any workers already in the process of stopping will be waited for.
 func (manager *managerImpl) StopWorker(names ...string) error {
 	manager.mutex.Lock()
 	defer manager.mutex.Unlock()
 
+	wait := sync.WaitGroup{}
+	defer wait.Wait()
 	for _, name := range names {
 		definition, ok := manager.workers[name]
 		if !ok {
-			log.Error().Str("name", name).Msg("Worker not found")
+			log.Error().Str("name", name).Msg("Cannot stop worker, worker not found")
 			return ErrorWorkerNotFound
 		}
 
+		if definition.stop == nil {
+			log.Debug().Str("name", name).Msg("Cannot stop worker, worker not running")
+			return ErrorWorkerNotRunning
+		}
+
 		log.Debug().Str("name", name).Msg("Sending stop request to worker")
-		definition.stopped = true
+		definition.stop <- true
+
+		wait.Add(1)
+		go func(name string, stopped <-chan bool) {
+			defer wait.Done()
+			log.Debug().Str("name", name).Msg("Waiting for worker to stop")
+			<-stopped
+			log.Debug().Str("name", name).Msg("Worker stopped")
+		}(name, definition.stopped)
 
 		log.Debug().Str("name", name).Msg("Stopping worker")
 		if err := definition.worker.Stop(); err != nil {
 			log.Error().Err(err).Str("name", name).Msg("Failed to stop worker")
 			return err
 		}
+		log.Debug().Str("name", name).Msg("Worker stopped")
+
+		close(definition.stop)
+		definition.stop = nil
+		definition.stopped = nil
 	}
 
 	return nil

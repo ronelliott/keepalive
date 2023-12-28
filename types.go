@@ -19,10 +19,11 @@ type Manager interface {
 	// worker is already running, it is not restarted.
 	StartWorker(...string) error
 
-	// StopWorker stops the worker with the given name. If the worker is not found,
-	// ErrorWorkerNotFound is returned. If multiple workers are given, they are
-	// stopped in the order given. If any worker fails to stop, the error is logged
-	// and returned and no further workers are stopped.
+	// StopWorker stops the worker with the given name and waits for it to stop. If
+	// the worker is not found, ErrorWorkerNotFound is returned. If multiple workers
+	// are given, they are stopped in the order given. If any worker fails to stop,
+	// the error is logged and returned and no further workers are stopped, however
+	// any workers already in the process of stopping will be waited for.
 	StopWorker(...string) error
 
 	// StopAllWorkers stops all registered workers. This is a convenience method that

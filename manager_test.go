@@ -11,7 +11,7 @@ import (
 
 func TestManager_Basic(t *testing.T) {
 	manager := keepalive.NewManager()
-	worker := &testWorker{}
+	worker := newTestWorker()
 
 	err := manager.AddWorker("test", worker)
 	assert.NoError(t, err, "Adding a worker should succeed")
@@ -31,10 +31,11 @@ func TestManager_Basic(t *testing.T) {
 	assert.Equal(t, 1, worker.stopCallCount, "Worker should have been stopped once")
 }
 
-func TestManager_Run_Error(t *testing.T) {
+func TestManager_StartWorker_Error(t *testing.T) {
 	manager := keepalive.NewManager()
 
-	worker := &testWorker{runError: assert.AnError}
+	worker := newTestWorker()
+	worker.runError = assert.AnError
 
 	err := manager.AddWorker("test", worker)
 	assert.NoError(t, err, "Adding a worker should succeed")
@@ -51,10 +52,43 @@ func TestManager_Run_Error(t *testing.T) {
 	assert.Equal(t, 1, worker.stopCallCount, "Worker should have been stopped once")
 }
 
-func TestManager_Stop_Error(t *testing.T) {
+func TestManager_StartWorker_AlreadyRunning(t *testing.T) {
 	manager := keepalive.NewManager()
 
-	worker := &testWorker{stopError: assert.AnError}
+	worker := newTestWorker()
+
+	err := manager.AddWorker("test", worker)
+	assert.NoError(t, err, "Adding a worker should succeed")
+
+	err = manager.StartWorker("test")
+	assert.NoError(t, err, "Starting a worker should succeed")
+
+	err = manager.StartWorker("test")
+	assert.ErrorIs(t, err, keepalive.ErrorWorkerAlreadyRunning,
+		"Starting a worker that's already started should return an error")
+
+	time.Sleep(time.Millisecond * 100)
+
+	err = manager.StopWorker("test")
+	assert.NoError(t, err, "Stopping a worker should succeed")
+
+	assert.Equal(t, 1, worker.runCallCount, "Worker should have been run once")
+	assert.Equal(t, 1, worker.stopCallCount, "Worker should have been stopped once")
+}
+
+func TestManager_StartWorker_NotFound(t *testing.T) {
+	manager := keepalive.NewManager()
+
+	err := manager.StartWorker("test")
+	assert.ErrorIs(t, err, keepalive.ErrorWorkerNotFound,
+		"Starting a worker that doesn't exist should return an error")
+}
+
+func TestManager_StopWorker_Error(t *testing.T) {
+	manager := keepalive.NewManager()
+
+	worker := newTestWorker()
+	worker.stopError = assert.AnError
 
 	err := manager.AddWorker("test", worker)
 	assert.NoError(t, err, "Adding a worker should succeed")
@@ -71,11 +105,35 @@ func TestManager_Stop_Error(t *testing.T) {
 	assert.Equal(t, 1, worker.stopCallCount, "Worker should have been stopped once")
 }
 
-func TestManager_StopAll(t *testing.T) {
+func TestManager_StopWorker_NotRunning(t *testing.T) {
 	manager := keepalive.NewManager()
 
-	worker1 := &testWorker{}
-	worker2 := &testWorker{}
+	worker := newTestWorker()
+
+	err := manager.AddWorker("test", worker)
+	assert.NoError(t, err, "Adding a worker should succeed")
+
+	err = manager.StopWorker("test")
+	assert.ErrorIs(t, err, keepalive.ErrorWorkerNotRunning,
+		"Stopping a worker that's not running should return an error")
+
+	assert.Equal(t, 0, worker.runCallCount, "Worker should not have been run")
+	assert.Equal(t, 0, worker.stopCallCount, "Worker should not have been stopped")
+}
+
+func TestManager_StopWorker_NotFound(t *testing.T) {
+	manager := keepalive.NewManager()
+
+	err := manager.StopWorker("test")
+	assert.ErrorIs(t, err, keepalive.ErrorWorkerNotFound,
+		"Stopping a worker that doesn't exist should return an error")
+}
+
+func TestManager_StopAllWorkers(t *testing.T) {
+	manager := keepalive.NewManager()
+
+	worker1 := newTestWorker()
+	worker2 := newTestWorker()
 
 	err := manager.AddWorker("test1", worker1)
 	assert.NoError(t, err, "Adding worker 1 should succeed")
@@ -103,16 +161,35 @@ func TestManager_StopAll(t *testing.T) {
 type testWorker struct {
 	runCallCount  int
 	runError      error
+	stop          chan bool
 	stopCallCount int
 	stopError     error
 }
 
+func newTestWorker() *testWorker {
+	return &testWorker{
+		stop: make(chan bool, 1),
+	}
+}
+
 func (w *testWorker) Run() error {
 	w.runCallCount++
-	return w.runError
+	if w.runError != nil {
+		return w.runError
+	}
+
+	for {
+		select {
+		case <-w.stop:
+			return nil
+		default:
+			time.Sleep(time.Millisecond * 100)
+		}
+	}
 }
 
 func (w *testWorker) Stop() error {
 	w.stopCallCount++
+	w.stop <- true
 	return w.stopError
 }
